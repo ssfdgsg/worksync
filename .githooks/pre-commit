@@ -1,0 +1,65 @@
+#!/bin/sh
+# worksync pre-commit hook (version-controlled via core.hooksPath).
+# Order: gofmt -> go vet -> go test -> staged-content secret scan -> e2e hint.
+# Every worksync agent review must also check: e2e coverage, secret redaction,
+# unit tests, vet, formatting (see docs/REVIEW-CHECKLIST.md).
+set -e
+
+ROOT=$(git rev-parse --show-toplevel)
+cd "$ROOT" || exit 1
+
+# workspace-local Go caches (optional; no-op elsewhere)
+if [ -d "$ROOT/.modcache" ] && [ -z "$GOMODCACHE" ]; then
+  export GOMODCACHE="$ROOT/.modcache" GOPATH="$ROOT/.gopath" GOCACHE="$ROOT/.gocache"
+fi
+
+echo "==> pre-commit: gofmt / vet / test / secret scan / e2e hint"
+
+# 1. gofmt (fail on unformatted Go)
+FMT=$(gofmt -l internal/ cmd/ 2>/dev/null || true)
+if [ -n "$FMT" ]; then
+  echo "gofmt: unformatted files:"
+  echo "$FMT"
+  echo "run: gofmt -w $FMT"
+  exit 1
+fi
+echo "  gofmt ok"
+
+# 2. go vet
+go vet ./... || { echo "go vet FAILED"; exit 1; }
+echo "  go vet ok"
+
+# 3. unit tests
+go test ./... >/dev/null || { echo "go test FAILED"; exit 1; }
+echo "  go test ok"
+
+# 4. secret scan on staged content (lightweight grep; gitleaks optional)
+STAGED=$(git diff --cached --name-only --diff-filter=ACM || true)
+SKIP_RE="(^|/)(testdata|fixtures|vendor|node_modules)/|\.(png|jpg|jpeg|gif|pdf|lock|sum|wasm)$"
+PAT="AKIA[0-9A-Z]{16}|-----BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----|ghp_[0-9A-Za-z]{36}|github_pat_[0-9A-Za-z_]{22,}|xox[baprs]-[0-9A-Za-z-]{10,}|sk-[0-9A-Za-z]{20,}|(api[_-]?key|secret|password|token)[[:space:]]*[:=][[:space:]]*[A-Za-z0-9/+=._-]{16,}"
+FOUND=0
+TMPF=$(mktemp)
+echo "$STAGED" | grep -vE "$SKIP_RE" > "$TMPF" || true
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  [ -f "$f" ] || continue
+  if git show :"$f" 2>/dev/null | grep -nE "$PAT" >/dev/null; then
+    echo "!! possible secret in staged file: $f"
+    git show :"$f" 2>/dev/null | grep -nE "$PAT" | head -5
+    FOUND=1
+  fi
+done < "$TMPF"
+rm -f "$TMPF"
+if [ "$FOUND" -ne 0 ]; then
+  echo "secret scan FAILED: redact or remove secrets before committing"
+  exit 1
+fi
+echo "  secret scan ok"
+
+# 5. e2e hint: if transport/snapshot/coord/runtime code changed, remind to run e2e
+if echo "$STAGED" | grep -qE "internal/(transport|snapshot|coord|runtime)/"; then
+  echo "  NOTE: transport/snapshot/coord/runtime code changed — run the e2e suite before merging:"
+  echo "    docs/E2E-GUIDE.md (up/commit/rollback + push/pull roundtrip)"
+fi
+
+echo "==> pre-commit checks passed"
