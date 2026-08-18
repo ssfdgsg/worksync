@@ -73,6 +73,10 @@ worksync up              # recreate the container
 | `push`, `pull`, `fetch` | transfer commits to/from a remote |
 | `doctor` | diagnose the environment |
 
+`expose`/`unexpose` automatically checkpoint the current container rootfs
+before replacing the container. The same workspace, home and named volumes
+are reattached, so changing ports does not discard uncommitted environment state.
+
 Global flags: `--json` (machine-readable output on query commands) and
 `--debug`.
 

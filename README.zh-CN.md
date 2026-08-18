@@ -68,6 +68,9 @@ worksync up              # 重建容器
 | `push`、`pull`、`fetch` | 与远端传输提交 |
 | `doctor` | 环境诊断 |
 
+`expose`/`unexpose` 会自动 checkpoint 当前容器 RootFS 后替换容器实例；workspace、
+home 和命名卷保持原路径重新挂载，因此端口变化不会丢失未显式提交的开发环境状态。
+
 全局参数:`--json`(查询命令输出机器可读格式)与 `--debug`。
 
 ## 项目规格

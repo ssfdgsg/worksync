@@ -760,6 +760,12 @@ worksync unexpose 3000
 
 `expose` 的默认监听地址是 `127.0.0.1`。
 
+Podman 的发布端口在容器创建时确定，因此 `expose`/`unexpose` 需要替换容器实例。
+替换前 Worksync 必须先停止容器并执行一次内部 RootFS checkpoint，再从该 checkpoint
+创建具有新端口映射的容器，同时重新挂载原有 workspace、home 和命名卷。该 checkpoint
+不进入用户可见的 Commit/Ref 历史，也不由 `push` 上传；它只用于防止端口变更丢失尚未
+显式提交的容器 writable layer。checkpoint 失败时不得删除旧容器。
+
 ### 18.3 版本
 
 ```bash

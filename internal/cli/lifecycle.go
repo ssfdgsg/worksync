@@ -595,17 +595,48 @@ func (a *App) checkoutImage(proj *project.Project) (string, error) {
 	return co.ImageRef, nil
 }
 
-// restartForPorts removes the container and re-provisions it so dynamic
-// port changes take effect (rootless podman cannot republish live).
+// checkpointAndRemoveForPorts freezes the current writable layer before a
+// port-driven re-provision. Mount-backed workspaces and volumes already live
+// outside the container, but podman rm would otherwise discard packages and
+// tools installed in the container since the last user-visible commit.
+//
+// The returned image is an internal checkpoint only: it is not added to the
+// worksync commit graph and is not pushed to remotes. If stop or commit fails,
+// the old container is deliberately left in place.
+func checkpointAndRemoveForPorts(ctx context.Context, rt *podman.Client, c *state.Container) (string, error) {
+	if c.State == state.StateRunning {
+		if err := rt.Stop(ctx, c.ContainerID, 10); err != nil {
+			return "", fmt.Errorf("stop container before port checkpoint: %w", err)
+		}
+	}
+	image, err := rt.Commit(ctx, c.ContainerID)
+	if err != nil {
+		return "", fmt.Errorf("checkpoint container before changing ports: %w", err)
+	}
+	image = strings.TrimSpace(image)
+	if image == "" {
+		return "", fmt.Errorf("checkpoint container before changing ports: podman returned an empty image reference")
+	}
+	if err := rt.Rm(ctx, c.ContainerID); err != nil {
+		return "", fmt.Errorf("remove checkpointed container: %w", err)
+	}
+	return image, nil
+}
+
+// restartForPorts checkpoints and replaces the container so dynamic port
+// changes take effect (rootless podman cannot republish a live container).
+// The same host-backed workspace/home/volumes are attached to the replacement.
 func (a *App) restartForPorts(ctx context.Context, proj *project.Project, b backend.Backend) error {
 	if err := requireTool("podman"); err != nil {
 		return err
 	}
 	rt := podman.New(b, "")
+	envImage := ""
 	c, err := a.DB.GetContainer(proj.ID)
 	if err == nil && c.ContainerID != "" {
-		_ = rt.Stop(ctx, c.ContainerID, 10)
-		if err := rt.Rm(ctx, c.ContainerID); err != nil {
+		fmt.Fprintln(a.Stdout, "checkpointing container rootfs before changing ports...")
+		envImage, err = checkpointAndRemoveForPorts(ctx, rt, c)
+		if err != nil {
 			return err
 		}
 		if err := a.DB.DeleteContainer(proj.ID); err != nil {
@@ -617,11 +648,13 @@ func (a *App) restartForPorts(ctx context.Context, proj *project.Project, b back
 	if err != nil {
 		return err
 	}
-	// keep creating from a checked-out environment image across the
-	// re-provision (E2E-001).
-	envImage, err := a.checkoutImage(proj)
-	if err != nil {
-		return err
+	// With no live container (for example after `worksync rm`), keep creating
+	// from a checked-out environment image across the re-provision (E2E-001).
+	if envImage == "" {
+		envImage, err = a.checkoutImage(proj)
+		if err != nil {
+			return err
+		}
 	}
 	return a.provisionContainer(ctx, proj, b, rt, concretePorts, envImage)
 }
