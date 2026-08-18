@@ -15,6 +15,7 @@
 - dsh web 未认证访问返回 `401`，携带 token 后返回 `200` 和 DeepSeek Harness 页面。
 - 本机和 aly 的 `expose`/`unexpose` 均触发容器替换；容器 ID 改变，但 RootFS marker、dsh 主程序和插件卷保持不变。
 - aly 上可直接运行 `/usr/local/bin/dsh --version`，输出 `0.1.0-rc.6`。
+- 真实 `ssh -t` 场景下，宿主包装器为容器分配 TTY，`dsh-tui@0.8.1` 成功绘制并进入交互输入界面。
 - aly 的 k3s 在低内存安装期间临时停止，验证完成后已恢复为 `active`。
 
 本轮同时确认：当前 v0 不能直接把 arm64 容器 writable layer 恢复到 amd64。目标机采用相同 manifest 的 amd64 基础镜像原生重建，再从国内 npm 镜像安装目标架构依赖。
@@ -148,6 +149,11 @@ pnpm --network-concurrency 2 --child-concurrency 1
 
 四个 profile 串行安装成功，全程 swap 使用量为 0。完成后 k3s 已恢复 `active`。
 
+初次 TTY 验证还发现：`@deepseek-ai/dsh@0.1.0-rc.6` 的 caret 依赖已解析到 rc7，
+而 `dsh-tui@0.8.0` 只接受 rc6。将 TUI 升级到 `0.8.1` 后，它声明并接受 rc7 peers。
+宿主 `/usr/local/bin/dsh` 同时增加 TTY 检测：交互终端走 `podman exec -it`，脚本和
+非交互命令继续走 `worksync exec`。真实 SSH PTY 下 TUI 成功启动。
+
 ### 5.3 最终状态
 
 ```text
@@ -156,6 +162,7 @@ dsh container        = running
 dsh web publish      = 127.0.0.1:13000 -> 3000/tcp
 unauthenticated HTTP = 401
 authenticated HTTP   = 200
+dsh TUI over SSH PTY = interactive
 k3s                  = active
 swap used            = 0 B
 ```
@@ -178,3 +185,4 @@ aly native Podman 上也重复通过 `expose`/`unexpose` checkpoint 测试。
 3. `doctor` 同时报告 backend capability 和当前 Podman 实际 rootless 状态，避免把“支持 rootless”误读为“当前 rootless”。
 4. 为 pnpm/npm 安装提供低内存 profile 或 bootstrap hook。
 5. 为 dsh web 增加正式的 authenticated reverse-proxy 配置；公网开放前必须配置 TLS、认证与安全组。
+6. 为 `worksync exec`/`shell` 增加显式 TTY 分配，避免交互程序依赖部署侧包装器直接调用 `podman exec -it`。
