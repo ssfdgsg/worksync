@@ -742,8 +742,8 @@ Commit 记录 Project Spec digest。Pull 后如果当前 spec 不同，Worksync 
 worksync init
 worksync up [--backend auto]
 worksync status
-worksync shell [-- command...]
-worksync exec -- command...
+worksync shell [--tty=auto|always|never] [-- command...]
+worksync exec [--tty=auto|always|never] -- command...
 worksync stop
 worksync start
 worksync rm
@@ -1040,6 +1040,12 @@ Remote Store GC 不属于 v0；v0 只提供报告未引用对象的 dry-run 能�
 
 原因：没有自动 merge 时，拒绝分叉覆盖是最安全、最可解释的行为。
 
+### ADR-007：宿主工具入口不得绕过 Worksync
+
+原因：`dsh` 等宿主 shim 只是用户入口；容器选择、TTY、IO、工作目录和生命周期必须由
+Worksync 统一管理。正式入口只能调用 `worksync exec/shell`，不得直接调用 Podman。
+`--tty=auto|always|never` 是交互程序进入受管容器的标准能力。
+
 ## 29. 待后续决策
 
 以下内容不阻塞 v0 开工：
@@ -1053,6 +1059,7 @@ Remote Store GC 不属于 v0；v0 只提供报告未引用对象的 dry-run 能�
 - 是否支持百度网盘 pack transport。
 - 是否引入 EROFS/Nydus lazy pull。
 - 是否为 OCI environment blobs 提供额外加密层。
+- 是否在 v1 将一个逻辑 Commit 扩展为多平台 OCI environment variants。
 
 ## 30. 参考资料
 
@@ -1064,3 +1071,4 @@ Remote Store GC 不属于 v0；v0 只提供报告未引用对象的 dry-run 能�
 - [Restic Repository Copy 与去重](https://restic.readthedocs.io/en/latest/045_working_with_repos.html)
 - [Development Container Specification](https://containers.dev/overview)
 - [QEMU User Networking](https://www.qemu.org/docs/master/system/qemu-manpage.html)
+- [dsh 部署目标与当前实现](dsh-deployment-target.md)

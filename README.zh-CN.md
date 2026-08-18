@@ -137,6 +137,7 @@ remote:
 ## 开发
 
 - 设计文档:[`docs/worksync-v0-design.md`](docs/worksync-v0-design.md)
+- dsh 部署目标:[`docs/dsh-deployment-target.md`](docs/dsh-deployment-target.md)
 - `make test`、`make vet`、`make fmt` —— 详见 [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## 状态

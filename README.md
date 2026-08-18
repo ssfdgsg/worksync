@@ -147,6 +147,7 @@ Environment overrides: `WORKSYNC_DATA_DIR`, `WORKSYNC_CONFIG_DIR`.
 ## Development
 
 - Design document: [`docs/worksync-v0-design.md`](docs/worksync-v0-design.md)
+- dsh deployment target: [`docs/dsh-deployment-target.md`](docs/dsh-deployment-target.md)
 - `make test`, `make vet`, `make fmt` — see [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## Status
