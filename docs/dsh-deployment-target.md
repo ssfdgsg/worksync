@@ -166,3 +166,55 @@ Project Spec/bootstrap 必须允许显式配置镜像源，不能把国外 regis
 - Web 未认证拒绝、认证通过，默认不监听公网。
 - 同架构 pull/rollback 恢复 environment；跨架构明确选择对应 OCI variant 或 bootstrap。
 - Git、remote store 和日志中没有 SSH 私钥、API token 或 restic 密码。
+
+## 10. 实施计划
+
+### P0：容器可写层持久化改造
+
+当前只在 `expose`/`unexpose` 路径执行内部 RootFS checkpoint；配置漂移触发的 `up`
+重建尚未统一使用该机制。因此“端口变化不丢状态”已经实现，但“所有自动重建都不丢
+可写层”尚未完成。
+
+目标状态机：
+
+```text
+running container
+  → stop/quiesce
+  → checkpoint writable layer
+  → persist checkpoint metadata
+  → create replacement candidate
+  → attach original volumes
+  → start + verify candidate
+  → atomically switch active container record
+  → retain previous checkpoint for recovery
+  → reachability-based GC
+```
+
+实施项：
+
+1. 把 checkpoint 从 `restartForPorts` 私有逻辑提升为 Runtime/Coordinator 的统一能力。
+2. 覆盖端口变更、manifest/config drift、image 更新和运行时修复等所有自动重建路径。
+3. State DB 记录 checkpoint image、源容器、平台、原因、创建时间和恢复状态。
+4. 新容器成功启动并写入 DB 前，不删除唯一可恢复的旧 checkpoint。
+5. 创建/启动失败时允许从 checkpoint 重试，不回退到 manifest base image。
+6. 用户执行 `worksync commit` 时可复用或提升当前 checkpoint，避免无意义的重复 commit。
+7. 内部 checkpoint 不进入用户 Commit/Ref，也不由 `push` 上传；显式 commit 后才成为可同步 environment。
+8. GC 只删除未被 active container、checkout、Commit 或 recovery record 引用的镜像。
+9. checkpoint descriptor 必须记录 OCI platform；不同 CPU 架构之间不得复用 writable layer。
+10. E2E 覆盖端口重建、配置漂移、创建失败、启动失败、进程中断和 GC 后恢复。
+
+验收标准：任何由 Worksync 自动触发的容器替换，都必须保留可写层和挂载卷；失败时至少
+保留一个可重建的 checkpoint，不允许静默回到基础镜像。
+
+### P1：Worksync 原生 TTY
+
+1. 实现 `worksync exec/shell --tty=auto|always|never`。
+2. TTY 模式直接透传 IO、resize、信号和退出码。
+3. 删除 dsh shim 中直调 `podman exec -it` 的临时分支。
+4. 真实 SSH PTY 下验证 dsh TUI。
+
+### P2：跨架构 environment
+
+1. Commit Descriptor 支持 `linux/arm64`、`linux/amd64` 等 environment variants。
+2. 没有目标平台 variant 时执行声明式 bootstrap，而不是加载不兼容 OCI。
+3. portable `.dsh` 数据与 per-platform plugin cache 分离。

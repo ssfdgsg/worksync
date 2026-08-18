@@ -1000,6 +1000,14 @@ Remote Store GC 不属于 v0；v0 只提供报告未引用对象的 dry-run 能�
 - 集成测试。
 - 用户文档。
 
+### M7：运行态保真
+
+- 统一可写层 checkpoint，不限于端口变更路径。
+- 配置漂移、镜像更新和自动修复时保留 RootFS writable layer。
+- checkpoint 状态入库、失败恢复、延迟清理与可达性 GC。
+- `exec`/`shell` 原生 TTY 与信号、resize、退出码透传。
+- dsh 等宿主 shim 完全通过 Worksync，不直接调用 Podman。
+
 ## 27. 风险
 
 | 风险 | 影响 | 缓解措施 |
