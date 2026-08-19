@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,52 +15,13 @@ import (
 	"worksync/internal/state"
 )
 
-// initTemplate is the scaffold produced by `worksync init` (design §12.1).
-const initTemplate = `schemaVersion: 1
-name: %s
-
-runtime:
-  engine: podman
-  backend: auto
-  rootless: true
-
-container:
-  image: %s
-  persistentRoot: true
-  workdir: /workspace
-  user: dev
-  command: ["/opt/worksync/bin/worksync-agent", "idle"]
-  environment:
-    NODE_ENV: development
-
-ports:
-  - name: web
-    target: 3000
-    published: auto
-    listen: 127.0.0.1
-    protocol: tcp
-
-volumes:
-  workspace:
-    source:
-      type: host
-      path: ./
-    target: /workspace
-    policy: tracked
-
-  home:
-    target: /home/dev
-    policy: persistent
-
-commit:
-  environment: true
-  volumes:
-    - workspace
-`
+// initDefaultPortYAML is the scaffold's default published-port block.
+// (kept in sync with defaultPortYAML in tui.go)
 
 func cmdInit(ctx context.Context, app *App, args []string) error {
 	name := ""
-	image := "node:24"
+	image := ""
+	lang := ""
 	force := false
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -75,6 +37,12 @@ func cmdInit(ctx context.Context, app *App, args []string) error {
 				return &WbError{Code: CodeConfig, Message: "--image requires a value"}
 			}
 			image = args[i]
+		case "--lang":
+			i++
+			if i >= len(args) {
+				return &WbError{Code: CodeConfig, Message: "--lang requires a value"}
+			}
+			lang = args[i]
 		case "--force":
 			force = true
 		case "--json", "--debug":
@@ -94,13 +62,71 @@ func cmdInit(ctx context.Context, app *App, args []string) error {
 	if _, err := os.Stat(path); err == nil && !force {
 		return &WbError{Code: CodeConfig, Message: fmt.Sprintf("%s already exists (use --force to overwrite)", path)}
 	}
-	content := fmt.Sprintf(initTemplate, name, image)
+	// Guided wizard unless the image is already pinned by a flag: the wizard
+	// runs on any terminal (not only TTYs) so interactive customizing works
+	// from wrapped/GUI terminals too; a closed/piped stdin falls back to the
+	// scaffold defaults and --name/--image/--lang skip the matching step.
+	var content string
+	if image == "" && lang == "" {
+		var portYAML string
+		name, image, portYAML, err = app.initWizard(name)
+		if errors.Is(err, errInitCancelled) {
+			fmt.Fprintf(app.Stdout, "%s\n", app.yellow("init cancelled — nothing written"))
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		content = portYAML
+	} else {
+		if image == "" {
+			if lang != "" {
+				image = langImage(lang)
+			} else {
+				image = langImage("")
+			}
+		}
+		content = buildInitYAML(name, image, defaultPortYAML())
+	}
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		return err
 	}
-	fmt.Fprintf(app.Stdout, "created %s\n", path)
-	fmt.Fprintf(app.Stdout, "next: run [worksync up] to create the development container\n")
+	fmt.Fprintf(app.Stdout, "%s\n", app.green("created "+path))
+	fmt.Fprintf(app.Stdout, "next: run %s to create the development container\n", app.bold("[worksync up]"))
 	return nil
+}
+
+// langImage returns the recommended base image for a language stack. The
+// exact tag follows the project's supported toolchains; keep it in sync
+// with detectLang's hints.
+func langImage(lang string) string {
+	switch strings.ToLower(lang) {
+	case "go", "golang":
+		return "golang:1.24"
+	case "node", "nodejs", "js", "ts", "typescript":
+		return "node:24"
+	case "python", "py":
+		return "python:3.13"
+	case "rust", "rs":
+		return "rust:1.83"
+	case "java", "jvm":
+		return "eclipse-temurin:21-jdk"
+	default:
+		// generic development base: full toolchain (apt, git, curl) instead
+		// of a busybox-style minimal rootfs that lacks package managers.
+		return "debian:bookworm-slim"
+	}
+}
+
+// imageChoices lists the base images offered by the interactive init menu.
+// Keep in sync with langImage so --lang names match menu entries.
+var imageChoices = []struct{ lang, image string }{
+	{"go", "golang:1.24"},
+	{"node", "node:24"},
+	{"python", "python:3.13"},
+	{"rust", "rust:1.83"},
+	{"java", "eclipse-temurin:21-jdk"},
+	{"generic (apt/git/curl)", "debian:bookworm-slim"},
 }
 
 // sanitizeName maps an arbitrary directory name to a valid project name.

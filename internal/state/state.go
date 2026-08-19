@@ -126,6 +126,17 @@ CREATE TABLE IF NOT EXISTS checkouts (
 	updated_at    TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS checkpoints (
+	project_id        TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+	image_ref         TEXT NOT NULL,
+	source_container  TEXT NOT NULL DEFAULT '',
+	platform          TEXT NOT NULL DEFAULT '',
+	reason            TEXT NOT NULL DEFAULT '',
+	created_at        TEXT NOT NULL,
+	restored_at       TEXT NOT NULL DEFAULT '',
+	PRIMARY KEY (project_id, image_ref)
+);
+
 CREATE TABLE IF NOT EXISTS operations (
 	id          TEXT PRIMARY KEY,
 	project_id  TEXT NOT NULL,
@@ -155,6 +166,10 @@ func (s *TimeScanner) Scan(v interface{}) error {
 	case nil:
 		s.Time = time.Time{}
 	case string:
+		if x == "" {
+			s.Time = time.Time{}
+			return nil
+		}
 		t, err := time.Parse(time.RFC3339Nano, x)
 		if err != nil {
 			return fmt.Errorf("parse time %q: %w", x, err)

@@ -43,9 +43,14 @@ echo "$STAGED" | grep -vE "$SKIP_RE" > "$TMPF" || true
 while IFS= read -r f; do
   [ -n "$f" ] || continue
   [ -f "$f" ] || continue
-  if git show :"$f" 2>/dev/null | grep -nE "$PAT" >/dev/null; then
+  MATCHES=$(git show :"$f" 2>/dev/null | grep -nE "$PAT" || true)
+  # ignore matches that live in comments/doc lines (real credentials are
+  # never committed as comments; this avoids flagging env-var names such as
+  # WORKSYNC_RESTIC_PASSWORD described in a code comment)
+  FILTERED=$(printf '%s\n' "$MATCHES" | grep -vE '^[0-9]+:[[:space:]]*(//|#|\*|/\*)' || true)
+  if [ -n "$FILTERED" ]; then
     echo "!! possible secret in staged file: $f"
-    git show :"$f" 2>/dev/null | grep -nE "$PAT" | head -5
+    printf '%s\n' "$FILTERED" | head -5
     FOUND=1
   fi
 done < "$TMPF"

@@ -15,6 +15,15 @@ var ErrNotFound = errors.New("not found")
 
 const timeLayout = time.RFC3339Nano
 
+// formatTime formats a time for storage; the zero value becomes an empty
+// string so optional timestamps (e.g. restored_at) stay readable.
+func formatTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format(timeLayout)
+}
+
 func parseTime(s string) time.Time {
 	t, _ := time.Parse(timeLayout, s)
 	return t
@@ -160,6 +169,72 @@ func (d *DB) GetCheckout(projectID string) (*Checkout, error) {
 // DeleteCheckout removes the project's checkout row.
 func (d *DB) DeleteCheckout(projectID string) error {
 	_, err := d.sql.Exec(`DELETE FROM checkouts WHERE project_id=?`, projectID)
+	return err
+}
+
+// ---- checkpoints ----
+
+// UpsertCheckpoint inserts or replaces an internal checkpoint row.
+func (d *DB) UpsertCheckpoint(c Checkpoint) error {
+	_, err := d.sql.Exec(`INSERT INTO checkpoints (project_id, image_ref, source_container, platform, reason, created_at, restored_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(project_id, image_ref) DO UPDATE SET
+			source_container=excluded.source_container, platform=excluded.platform,
+			reason=excluded.reason, restored_at=excluded.restored_at`,
+		c.ProjectID, c.ImageRef, c.SourceContainer, c.Platform, c.Reason,
+		formatTime(c.CreatedAt), formatTime(c.RestoredAt))
+	return err
+}
+
+// LatestCheckpoint returns the most recent checkpoint row for a project,
+// or ErrNotFound.
+func (d *DB) LatestCheckpoint(projectID string) (*Checkpoint, error) {
+	row := d.sql.QueryRow(`SELECT project_id, image_ref, source_container, platform, reason, created_at, restored_at
+		FROM checkpoints WHERE project_id=? ORDER BY created_at DESC LIMIT 1`, projectID)
+	var c Checkpoint
+	var created, restored TimeScanner
+	if err := row.Scan(&c.ProjectID, &c.ImageRef, &c.SourceContainer, &c.Platform, &c.Reason, &created, &restored); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	c.CreatedAt = created.Time
+	c.RestoredAt = restored.Time
+	return &c, nil
+}
+
+// ListCheckpoints returns all checkpoint rows for a project, newest first.
+func (d *DB) ListCheckpoints(projectID string) ([]Checkpoint, error) {
+	rows, err := d.sql.Query(`SELECT project_id, image_ref, source_container, platform, reason, created_at, restored_at
+		FROM checkpoints WHERE project_id=? ORDER BY created_at DESC`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Checkpoint
+	for rows.Next() {
+		var c Checkpoint
+		var created, restored TimeScanner
+		if err := rows.Scan(&c.ProjectID, &c.ImageRef, &c.SourceContainer, &c.Platform, &c.Reason, &created, &restored); err != nil {
+			return nil, err
+		}
+		c.CreatedAt = created.Time
+		c.RestoredAt = restored.Time
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// MarkCheckpointRestored sets restored_at for a checkpoint row.
+func (d *DB) MarkCheckpointRestored(projectID, imageRef string) error {
+	_, err := d.sql.Exec(`UPDATE checkpoints SET restored_at=? WHERE project_id=? AND image_ref=?`, nowUTC(), projectID, imageRef)
+	return err
+}
+
+// DeleteCheckpoint removes a checkpoint row.
+func (d *DB) DeleteCheckpoint(projectID, imageRef string) error {
+	_, err := d.sql.Exec(`DELETE FROM checkpoints WHERE project_id=? AND image_ref=?`, projectID, imageRef)
 	return err
 }
 

@@ -21,6 +21,13 @@ import (
 	"worksync/internal/store"
 )
 
+// Build metadata injected at link time (-ldflags). A plain go build leaves
+// them at their defaults so the binary still identifies itself.
+var (
+	Version   = "dev"
+	BuildTime = ""
+)
+
 // ErrNotImplemented reports a command that is registered in v0's CLI surface
 // but not yet implemented in this build milestone.
 var ErrNotImplemented = errors.New("not implemented in this build")
@@ -50,11 +57,15 @@ const (
 type App struct {
 	Stdout io.Writer
 	Stderr io.Writer
+	Stdin  io.Reader // interactive input (menu prompts); nil means non-interactive
 	Layout *store.Layout
 	DB     *state.DB
 	Debug  bool
 	JSON   bool
-	wd     string
+	// Interactive reports whether both stdin and stdout are real terminals:
+	// guided prompts and colored output are only enabled then.
+	Interactive bool
+	wd          string
 }
 
 // Command is one subcommand.
@@ -85,7 +96,15 @@ func NewApp(stdout, stderr io.Writer) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &App{Stdout: stdout, Stderr: stderr, Layout: layout, DB: db}, nil
+	in, _ := os.Stdin.Stat()
+	out, _ := stdout.(*os.File)
+	interactive := false
+	if in != nil && out != nil {
+		fo, err := out.Stat()
+		interactive = err == nil &&
+			(in.Mode()&os.ModeCharDevice) != 0 && (fo.Mode()&os.ModeCharDevice) != 0
+	}
+	return &App{Stdout: stdout, Stderr: stderr, Stdin: os.Stdin, Layout: layout, DB: db, Interactive: interactive}, nil
 }
 
 // Close releases the state DB.
@@ -98,7 +117,7 @@ var commands []Command
 
 func init() {
 	commands = []Command{
-		{Name: "init", Usage: "init [--name NAME] [--image IMAGE] [--force]", Short: "scaffold a new worksync.yaml", Run: cmdInit},
+		{Name: "init", Usage: "init [--name NAME] [--image IMAGE] [--lang LANG] [--force]", Short: "scaffold a new worksync.yaml", Run: cmdInit},
 		{Name: "up", Usage: "up [--backend auto]", Short: "create or start the development container", Run: cmdUp},
 		{Name: "status", Usage: "status [--json]", Short: "show project and container state", Run: cmdStatus},
 		{Name: "shell", Usage: "shell [-- command...]", Short: "open an interactive shell in the container", Run: cmdShell},
@@ -118,6 +137,7 @@ func init() {
 		{Name: "push", Usage: "push [REMOTE] [TAG]", Short: "push commits to a remote store", Run: cmdPush},
 		{Name: "pull", Usage: "pull [REMOTE] [TAG]", Short: "pull commits from a remote store", Run: cmdPull},
 		{Name: "fetch", Usage: "fetch [REMOTE] [REF]", Short: "fetch remote objects without applying", Run: cmdFetch},
+		{Name: "checkpoint", Usage: "checkpoint export|import|list", Short: "freeze, export or import the writable layer", Run: cmdCheckpoint},
 		{Name: "doctor", Usage: "doctor", Short: "diagnose the environment", Run: cmdDoctor},
 		{Name: "help", Usage: "help [COMMAND]", Short: "show help", Run: cmdHelp},
 	}
@@ -135,6 +155,10 @@ func findCommand(name string) *Command {
 
 // Run dispatches argv (excluding the program name) to a subcommand.
 func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
+	if len(argv) == 1 && (argv[0] == "--version" || argv[0] == "-v") {
+		fmt.Fprintf(stdout, "worksync %s (built %s)\n", Version, BuildTime)
+		return 0
+	}
 	if len(argv) == 0 {
 		printUsage(stderr)
 		return 2

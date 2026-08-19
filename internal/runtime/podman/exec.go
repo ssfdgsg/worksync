@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	"worksync/internal/executil"
@@ -82,9 +83,28 @@ func (c *Client) Stop(ctx context.Context, id string, timeoutSeconds uint) error
 	return err
 }
 
-// Exec runs a command in a running container, streaming output.
+// Exec runs a command in a running container with captured output
+// (no TTY, output buffered). Used by coord and one-shot exec.
 func (c *Client) Exec(ctx context.Context, id string, cmd []string) (executil.Result, error) {
-	return c.Run(ctx, ExecArgs(id, cmd)...)
+	return c.Run(ctx, ExecArgs(id, cmd, false)...)
+}
+
+// ExecStream runs a command in a running container with stdin/stdout/stderr
+// attached to the given writers. With tty=true it allocates a pseudo-TTY
+// (-it) so interactive shells (worksync shell) behave like a real terminal.
+// Unlike Exec it streams output straight to the writers instead of capturing
+// it: podman needs its stdout to be a terminal to negotiate a TTY, so
+// buffering here is what made `worksync shell` appear frozen.
+func (c *Client) ExecStream(ctx context.Context, id string, cmd []string, tty bool, stdout, stderr io.Writer) (executil.Result, error) {
+	if c.ProbeErr != nil {
+		return executil.Result{}, c.ProbeErr
+	}
+	args := append(append([]string{}, c.GlobalArgs...), ExecArgs(id, cmd, tty)...)
+	res, err := executil.Run(ctx, c.Bin, args, executil.WithStdout(stdout), executil.WithStderr(stderr))
+	if err != nil {
+		return res, wrapPodmanError(c.Bin, args, err)
+	}
+	return res, nil
 }
 
 // Commit creates an image from the container rootfs (design §14.2 step 6).
@@ -121,6 +141,12 @@ func (c *Client) Save(ctx context.Context, image, dest string) error {
 func (c *Client) Load(ctx context.Context, src string) error {
 	_, err := c.Run(ctx, LoadArgs(src)...)
 	return err
+}
+
+// LoadOut imports an OCI archive and returns the load output (image refs).
+func (c *Client) LoadOut(ctx context.Context, src string) (string, error) {
+	res, err := c.Run(ctx, LoadArgs(src)...)
+	return res.Stdout, err
 }
 
 // Rm removes a container.

@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -23,6 +24,20 @@ import (
 // dataRoot returns the backend data root (design §9.2: native backend lives
 // under the host data directory).
 func (a *App) dataRoot() string { return filepath.Join(a.Layout.Root, "data") }
+
+// platformOf reports the OCI platform a checkpoint image was produced for.
+// The container runtime is Linux in both backends (native Linux, or the
+// Podman Machine VM), so the platform is linux/<host arch> here.
+func platformOf(b backend.Backend) string {
+	return "linux/" + runtime.GOARCH
+}
+
+// markCheckpointRestored records that a checkpoint was used to build a
+// replacement container, so later rebuilds do not reuse the same (already
+// consumed) writable layer.
+func markCheckpointRestored(a *App, projectID, imageRef string) {
+	_ = a.DB.MarkCheckpointRestored(projectID, imageRef)
+}
 
 // withProjectLock runs fn under the project lock with a journaled operation.
 // It implements design §21 (exclusive lock) and §9.4 (operations journal).
@@ -252,6 +267,7 @@ func cmdUp(ctx context.Context, app *App, args []string) error {
 		}
 		rt := podman.New(b, "")
 		name := podman.ContainerName(proj.ID)
+		envImage := "" // filled by drift checkpoint or checkout image
 		exists, err := rt.ExistsContainer(ctx, name)
 		if err != nil {
 			return err
@@ -282,17 +298,24 @@ func cmdUp(ctx context.Context, app *App, args []string) error {
 				return nil
 			}
 			fmt.Fprintf(app.Stdout, "container config changed or unknown; rebuilding %s\n", name)
-			// remove the podman container whether or not a DB row exists: a
-			// container present in podman but unknown to the DB must also be
-			// removed, otherwise the create below fails on the name.
-			target := name
+			// P0 (design M7): a drift rebuild must preserve the writable layer.
+			// When a DB row exists the unified checkpoint primitive stops,
+			// commits and records the current rootfs before removal, so the
+			// replacement can be built from it instead of the manifest base
+			// image. A container present in podman but unknown to the DB has no
+			// recoverable checkpoint metadata; remove it directly so the create
+			// below does not fail on the name.
 			if c != nil && c.ContainerID != "" {
-				target = c.ContainerID
+				envImage, err = app.checkpointAndReplace(ctx, proj, b, "drift")
+				if err != nil {
+					return err
+				}
+			} else {
+				if err := rt.Rm(ctx, name); err != nil {
+					return err
+				}
+				_ = app.DB.DeleteContainer(proj.ID)
 			}
-			if err := rt.Rm(ctx, target); err != nil {
-				return err
-			}
-			_ = app.DB.DeleteContainer(proj.ID)
 		}
 		// resolve ports (reuse/allocate) and persist — only for (re)provision,
 		// never in the idempotent up path above (the DB already records the
@@ -311,7 +334,7 @@ func cmdUp(ctx context.Context, app *App, args []string) error {
 		// E2E-001: when the project is checked out (rolled back to a commit),
 		// provision from the committed environment image. A manifest change
 		// since the commit invalidates the checkout.
-		envImage, err := app.checkoutImage(proj)
+		envImage, err = app.checkoutImage(proj)
 		if err != nil {
 			return err
 		}
@@ -448,8 +471,10 @@ func cmdRm(ctx context.Context, app *App, args []string) error {
 	})
 }
 
-// exec runs a command in the container (used by shell and exec).
-func containerExec(ctx context.Context, app *App, b backend.Backend, cmd []string) error {
+// exec runs a command in the container (used by shell and exec). When tty is
+// true the output is streamed through with a pseudo-TTY (-it) so interactive
+// shells behave like a real terminal instead of buffering silently.
+func containerExec(ctx context.Context, app *App, b backend.Backend, cmd []string, tty bool) error {
 	c, err := app.DB.GetContainer(projIDFromCwd(app))
 	if err != nil {
 		return &WbError{Code: CodeNotFound, Message: "no container; run worksync up first"}
@@ -458,6 +483,17 @@ func containerExec(ctx context.Context, app *App, b backend.Backend, cmd []strin
 		return &WbError{Code: CodeNotFound, Message: fmt.Sprintf("container is %s; run worksync start", c.State)}
 	}
 	rt := podman.New(b, "")
+	if tty {
+		// stream stdin/stdout/stderr straight to the podman process
+		res, err := rt.ExecStream(ctx, c.ContainerID, cmd, true, app.Stdout, app.Stderr)
+		if err != nil {
+			return err
+		}
+		if res.ExitCode != 0 {
+			return &WbError{Code: CodeInternal, Message: fmt.Sprintf("command exited %d", res.ExitCode)}
+		}
+		return nil
+	}
 	res, err := rt.Exec(ctx, c.ContainerID, cmd)
 	if err != nil {
 		return err
@@ -499,7 +535,7 @@ func cmdExec(ctx context.Context, app *App, args []string) error {
 	if len(cmd) == 0 {
 		return &WbError{Code: CodeConfig, Message: "usage: worksync exec -- command..."}
 	}
-	return containerExec(ctx, app, b, cmd)
+	return containerExec(ctx, app, b, cmd, false)
 }
 
 // cmdShell opens an interactive shell in the container (design §18.1). For
@@ -521,7 +557,7 @@ func cmdShell(ctx context.Context, app *App, args []string) error {
 	if len(args) > 0 && args[0] == "--" && len(args) > 1 {
 		cmd = args[1:]
 	}
-	return containerExec(ctx, app, b, cmd)
+	return containerExec(ctx, app, b, cmd, true)
 }
 
 // provisionContainer pulls (unless creating from a checked-out environment
@@ -532,11 +568,23 @@ func cmdShell(ctx context.Context, app *App, args []string) error {
 func (a *App) provisionContainer(ctx context.Context, proj *project.Project, b backend.Backend, rt *podman.Client, concretePorts []ports.Port, envImage string) error {
 	name := podman.ContainerName(proj.ID)
 	imageRef := ""
+	restoreCheckpoint := "" // set when the replacement is built from a checkpoint
 	if envImage != "" {
 		// the committed rootfs is already present locally (loaded by
 		// rollback/pull); no pull, use the digest directly.
 		fmt.Fprintf(a.Stdout, "creating from committed environment image...\n")
 		imageRef = envImage
+	} else if cp, cperr := a.DB.LatestCheckpoint(proj.ID); cperr == nil && cp.RestoredAt.IsZero() && platformOf(b) == cp.Platform {
+		// P0 (design M7): never silently fall back to the manifest base image
+		// when an unused, platform-matching internal checkpoint exists. The
+		// checkpoint image was already committed locally, so no pull is
+		// needed. It is marked restored only after the replacement is fully
+		// created AND started: a failed create/start leaves the checkpoint
+		// unused so the next attempt retries from it (P0 acceptance: a failed
+		// auto rebuild never silently falls back to the base image).
+		fmt.Fprintf(a.Stdout, "creating from internal checkpoint %s...\n", shortDigest(cp.ImageRef))
+		imageRef = cp.ImageRef
+		restoreCheckpoint = cp.ImageRef
 	} else {
 		fmt.Fprintf(a.Stdout, "pulling %s...\n", proj.Manifest.Container.Image)
 		if err := rt.Pull(ctx, proj.Manifest.Container.Image); err != nil {
@@ -571,6 +619,11 @@ func (a *App) provisionContainer(ctx context.Context, proj *project.Project, b b
 	}); err != nil {
 		return err
 	}
+	// the replacement is running and recorded: only now is the checkpoint
+	// consumed (P0). Any earlier failure keeps it reusable.
+	if restoreCheckpoint != "" {
+		markCheckpointRestored(a, proj.ID, restoreCheckpoint)
+	}
 	fmt.Fprintf(a.Stdout, "container %s is running\n", name)
 	return nil
 }
@@ -595,30 +648,59 @@ func (a *App) checkoutImage(proj *project.Project) (string, error) {
 	return co.ImageRef, nil
 }
 
-// checkpointAndRemoveForPorts freezes the current writable layer before a
-// port-driven re-provision. Mount-backed workspaces and volumes already live
-// outside the container, but podman rm would otherwise discard packages and
-// tools installed in the container since the last user-visible commit.
+// checkpointAndReplace freezes the current writable layer and replaces the
+// container with a new one built from that checkpoint (Unified P0 primitive,
+// design M7). Mount-backed workspaces and volumes live outside the container,
+// but podman rm would otherwise discard packages installed since the last
+// user-visible commit.
 //
-// The returned image is an internal checkpoint only: it is not added to the
-// worksync commit graph and is not pushed to remotes. If stop or commit fails,
-// the old container is deliberately left in place.
-func checkpointAndRemoveForPorts(ctx context.Context, rt *podman.Client, c *state.Container) (string, error) {
+// The returned image is an internal checkpoint only: it is persisted in the
+// checkpoints table so an automatic rebuild can never silently fall back to
+// the manifest base image, but it is NOT added to the worksync commit graph
+// and is never pushed to remotes. If stop or commit fails, the old container
+// is deliberately left in place.
+func (a *App) checkpointAndReplace(ctx context.Context, proj *project.Project, b backend.Backend, reason string) (string, error) {
+	c, err := a.DB.GetContainer(proj.ID)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			return "", nil
+		}
+		return "", err
+	}
+	if c.ContainerID == "" {
+		return "", nil
+	}
+	rt := podman.New(b, "")
 	if c.State == state.StateRunning {
 		if err := rt.Stop(ctx, c.ContainerID, 10); err != nil {
-			return "", fmt.Errorf("stop container before port checkpoint: %w", err)
+			return "", fmt.Errorf("stop container before checkpoint: %w", err)
 		}
 	}
 	image, err := rt.Commit(ctx, c.ContainerID)
 	if err != nil {
-		return "", fmt.Errorf("checkpoint container before changing ports: %w", err)
+		return "", fmt.Errorf("checkpoint container: %w", err)
 	}
 	image = strings.TrimSpace(image)
 	if image == "" {
-		return "", fmt.Errorf("checkpoint container before changing ports: podman returned an empty image reference")
+		return "", fmt.Errorf("checkpoint container: podman returned an empty image reference")
+	}
+	if err := a.DB.UpsertCheckpoint(state.Checkpoint{
+		ProjectID:       proj.ID,
+		ImageRef:        image,
+		SourceContainer: c.ContainerID,
+		Platform:        platformOf(b),
+		Reason:          reason,
+		CreatedAt:       time.Now().UTC(),
+	}); err != nil {
+		// the checkpoint image exists but the record failed; keep the old
+		// container so nothing is lost.
+		return "", fmt.Errorf("record checkpoint: %w", err)
 	}
 	if err := rt.Rm(ctx, c.ContainerID); err != nil {
 		return "", fmt.Errorf("remove checkpointed container: %w", err)
+	}
+	if err := a.DB.DeleteContainer(proj.ID); err != nil {
+		return "", err
 	}
 	return image, nil
 }
@@ -632,14 +714,10 @@ func (a *App) restartForPorts(ctx context.Context, proj *project.Project, b back
 	}
 	rt := podman.New(b, "")
 	envImage := ""
-	c, err := a.DB.GetContainer(proj.ID)
-	if err == nil && c.ContainerID != "" {
+	if _, err := a.DB.GetContainer(proj.ID); err == nil {
 		fmt.Fprintln(a.Stdout, "checkpointing container rootfs before changing ports...")
-		envImage, err = checkpointAndRemoveForPorts(ctx, rt, c)
+		envImage, err = a.checkpointAndReplace(ctx, proj, b, "ports")
 		if err != nil {
-			return err
-		}
-		if err := a.DB.DeleteContainer(proj.ID); err != nil {
 			return err
 		}
 	}

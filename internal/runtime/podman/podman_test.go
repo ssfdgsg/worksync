@@ -1,6 +1,7 @@
 package podman
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"testing"
 
 	"worksync/internal/backend"
+	"worksync/internal/executil"
 	"worksync/internal/manifest"
 	"worksync/internal/ports"
 	"worksync/internal/volume"
@@ -82,6 +84,56 @@ func TestMountsFromManifest(t *testing.T) {
 	}
 	if byTarget["/run/secrets/token"].Host != "/data-root/demo/secrets/token" {
 		t.Errorf("secret host = %q", byTarget["/run/secrets/token"].Host)
+	}
+}
+
+func TestDefaultMachineConnection(t *testing.T) {
+	ctx := context.Background()
+	binDir := t.TempDir()
+	fake := filepath.Join(binDir, "podman")
+	oldPath := os.Getenv("PATH")
+	defer os.Setenv("PATH", oldPath)
+	// fake podman that always lists two connections, second is default
+	content := "#!/bin/sh\nif [ \"$1\" = system ] && [ \"$2\" = connection ]; then\n  echo \"myvm false\"\n  echo \"othervm true\"\n  exit 0\nfi\nexit 1\n"
+	if err := os.WriteFile(fake, []byte(content), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.Setenv("PATH", binDir+":"+oldPath)
+	// default marked connection wins
+	got, err := DefaultMachineConnection(ctx, "podman")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "othervm" {
+		t.Errorf("default connection = %q, want othervm", got)
+	}
+	// empty connection list is an actionable error, not a fallback
+	empty := filepath.Join(binDir, "podman-empty")
+	emptyContent := "#!/bin/sh\nexit 0\n"
+	if err := os.WriteFile(empty, []byte(emptyContent), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DefaultMachineConnection(ctx, "podman-empty"); err == nil || !strings.Contains(err.Error(), "podman machine init") {
+		t.Errorf("empty connections should hint at machine init, got %v", err)
+	}
+}
+
+func TestWrapPodmanError(t *testing.T) {
+	err := &executil.Error{Name: "podman", Args: []string{"pull", "img"}, ExitCode: 125, Stderr: "Error: read cli flags: connection \"podman-machine-default\" not found"}
+	wrapped := wrapPodmanError("podman", []string{"pull", "img"}, err)
+	if !strings.Contains(wrapped.Error(), "podman machine init") {
+		t.Errorf("connection-not-found should hint machine init, got: %v", wrapped)
+	}
+	// unrelated errors pass through unchanged
+	plain := &executil.Error{Name: "podman", Args: []string{"pull", "img"}, ExitCode: 1, Stderr: "some other error"}
+	if wrapPodmanError("podman", []string{"pull", "img"}, plain) != plain {
+		t.Errorf("unrelated error should pass through")
+	}
+	// missing container user is actionable
+	userErr := &executil.Error{Name: "podman", Args: []string{"start", "ctr"}, ExitCode: 125, Stderr: "unable to start container: unable to find user dev: no matching entries in passwd file"}
+	uw := wrapPodmanError("podman", []string{"start", "ctr"}, userErr)
+	if !strings.Contains(uw.Error(), "container.user") {
+		t.Errorf("user error should mention container.user, got: %v", uw)
 	}
 }
 
@@ -180,6 +232,36 @@ func TestClientEndToEnd(t *testing.T) {
 		if !strings.Contains(string(log), want) {
 			t.Errorf("missing %q in log: %s", want, log)
 		}
+	}
+}
+
+// TestExecStreamStreamsToWriter: ExecStream must route podman stdout to the
+// passed writer (streaming), not into the captured Result — otherwise podman
+// never sees a terminal and interactive shells freeze (regression for
+// `worksync shell` showing nothing and swallowing input).
+func TestExecStreamStreamsToWriter(t *testing.T) {
+	_, logPath := fakePodman(t)
+	c := New(backend.Backend{Kind: backend.KindNative}, "")
+	ctx := context.Background()
+	var out, errOut bytes.Buffer
+	res, err := c.ExecStream(ctx, "ctr1", []string{"/bin/sh", "-i"}, true, &out, &errOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// the fake's stdout goes to the writer, not to res.Stdout
+	if out.String() == "" {
+		t.Errorf("streamed output not written to writer (got %q)", out.String())
+	}
+	if got := res.Stdout; got != "" {
+		t.Errorf("captured stdout should be empty when streaming, got %q", got)
+	}
+	// -it flag must reach podman for interactive shells
+	log, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(log), "exec -it ctr1 /bin/sh -i") {
+		t.Errorf("expected exec -it in podman args, log: %s", log)
 	}
 }
 

@@ -97,6 +97,21 @@ type Checkout struct {
 	UpdatedAt    time.Time
 }
 
+// Checkpoint records an internal writable-layer freeze taken before a
+// container replacement (ports, drift, rollback). It is NOT part of the
+// user-visible commit graph and is never pushed to remotes; it exists so an
+// automatic rebuild can never silently fall back to the manifest base image
+// (design M7, dsh-deployment-target P0).
+type Checkpoint struct {
+	ProjectID       string
+	ImageRef        string // internal `podman commit` image digest
+	SourceContainer string // container id the checkpoint was taken from
+	Platform        string // OCI platform (e.g. linux/arm64)
+	Reason          string // ports | drift | rollback | export | manual
+	CreatedAt       time.Time
+	RestoredAt      time.Time // empty when not yet used to rebuild
+}
+
 // OperationKind is a mutating command kind recorded in the journal.
 type OperationKind string
 

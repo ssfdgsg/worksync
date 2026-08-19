@@ -80,9 +80,15 @@ func cmdCommit(ctx context.Context, app *App, args []string) error {
 	if err := requireTool("podman"); err != nil {
 		return err
 	}
+	if err := requireTool("restic"); err != nil {
+		return &WbError{Code: CodeConfig, Message: "commit needs restic on PATH: install it (brew install restic) and retry"}
+	}
 	msg := flagValue(args, "-m")
 	if msg == "" {
-		return &WbError{Code: CodeConfig, Message: "commit requires -m MESSAGE"}
+		msg = flagValue(args, "--message")
+	}
+	if msg == "" {
+		return &WbError{Code: CodeConfig, Message: "commit requires -m MESSAGE (or --message MESSAGE)"}
 	}
 	return app.withProjectLock(ctx, proj.ID, state.OpCommit, func() error {
 		rt := podman.New(b, "")
@@ -219,19 +225,17 @@ func cmdRollback(ctx context.Context, app *App, args []string) error {
 			return cerr
 		}
 		rt := podman.New(b, "")
-		// stop and remove the current container so the rolled-back
-		// environment replaces it (design §17).
+		// P0 (design M7): preserve the current writable layer before the
+		// rolled-back environment replaces the container. Unlike the old
+		// stop+rm, the pre-rollback rootfs is checkpointed and recorded, so a
+		// failed restore never loses unreleased container state and no
+		// automatic rebuild silently falls back to the manifest base image.
 		if cerr == nil && container.ContainerID != "" {
-			fmt.Fprintf(app.Stdout, "stopping container %s...\n", container.Name)
-			_ = rt.Stop(ctx, container.ContainerID, 10)
-			if err := rt.Rm(ctx, container.ContainerID); err != nil {
+			fmt.Fprintf(app.Stdout, "checkpointing container %s before rollback...\n", container.Name)
+			if _, err := app.checkpointAndReplace(ctx, proj, b, "rollback"); err != nil {
 				return err
 			}
-			// E2E-004: the container is gone; drop the derived row so status
-			// no longer reports a stale running container.
-			if err := app.DB.DeleteContainer(proj.ID); err != nil {
-				return err
-			}
+			_ = app.DB.DeleteContainer(proj.ID)
 		}
 		// restore the environment image (design §16.4 pull step 4).
 		if desc.Environment.Image != "" {

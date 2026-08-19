@@ -23,26 +23,90 @@ type Client struct {
 	GlobalArgs []string // e.g. --remote --connection machine
 	Stdout     io.Writer
 	Stderr     io.Writer
+	// ProbeErr, when set, records a failed machine-connection probe; Run
+	// fails fast with it instead of executing podman against a bogus
+	// connection.
+	ProbeErr error
 }
 
 // New creates a client for the given backend. The podman-machine backend
-// routes through a named machine connection (design §7.3).
+// routes through a named machine connection (design §7.3). When machineName
+// is empty the default connection is probed via `podman system connection
+// ls`; a probe that finds no connection is surfaced as ProbeErr so the user
+// gets a clear diagnostic instead of a raw `connection not found` failure.
 func New(b backend.Backend, machineName string) *Client {
 	c := &Client{Bin: "podman"}
 	if b.Kind == backend.KindMachine {
 		conn := machineName
 		if conn == "" {
-			conn = "podman-machine-default"
+			var err error
+			conn, err = DefaultMachineConnection(context.Background(), c.Bin)
+			if err != nil {
+				c.ProbeErr = err
+				conn = "podman-machine-default" // placeholder; Run fails fast
+			}
 		}
 		c.GlobalArgs = []string{"--remote", "--connection", conn}
 	}
 	return c
 }
 
-// Run executes podman with args, returning captured output.
+// DefaultMachineConnection resolves the machine connection used for
+// --remote. It prefers the connection marked default in `podman system
+// connection ls`, then the first listed name. An empty result (no machine
+// configured on this host) returns a descriptive error with the fix.
+func DefaultMachineConnection(ctx context.Context, bin string) (string, error) {
+	res, err := executil.Run(ctx, bin, []string{"system", "connection", "ls", "--format", "{{.Name}} {{.Default}}"})
+	if err != nil {
+		return "", fmt.Errorf("cannot list podman connections: %v (is podman installed?) ", err)
+	}
+	best := ""
+	for _, line := range strings.Split(res.Stdout, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] == "" {
+			continue
+		}
+		if best == "" {
+			best = fields[0]
+		}
+		if fields[1] == "true" {
+			return fields[0], nil
+		}
+	}
+	if best != "" {
+		return best, nil
+	}
+	return "", fmt.Errorf("no podman machine found: run [podman machine init] then [podman machine start] (see [podman system connection ls])")
+}
+
+// Run executes podman with args, returning captured output. A failed
+// machine-connection probe fails fast with the probe diagnostic.
 func (c *Client) Run(ctx context.Context, args ...string) (executil.Result, error) {
+	if c.ProbeErr != nil {
+		return executil.Result{}, c.ProbeErr
+	}
 	all := append(append([]string{}, c.GlobalArgs...), args...)
-	return executil.Run(ctx, c.Bin, all, executil.WithStdout(c.Stdout), executil.WithStderr(c.Stderr))
+	res, err := executil.Run(ctx, c.Bin, all, executil.WithStdout(c.Stdout), executil.WithStderr(c.Stderr))
+	if err != nil {
+		return res, wrapPodmanError(c.Bin, all, err)
+	}
+	return res, nil
+}
+
+// wrapPodmanError turns raw podman exit errors into diagnostics a user can
+// act on, while keeping the underlying message available.
+func wrapPodmanError(bin string, args []string, err error) error {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "connection") && strings.Contains(msg, "not found"):
+		return fmt.Errorf("%s: podman connection not found — run [podman machine init] && [podman machine start] first", strings.Join(args, " "))
+	case strings.Contains(msg, "cannot connect"), strings.Contains(msg, "connection refused"), strings.Contains(msg, "no such host"):
+		return fmt.Errorf("%s: cannot reach podman — is the machine running? ([podman machine start])", strings.Join(args, " "))
+	case strings.Contains(msg, "unable to find user"):
+		return fmt.Errorf("the image has no such user (check container.user in worksync.yaml): %s", msg)
+	default:
+		return err
+	}
 }
 
 // ---- pure command builders (unit-testable) ----
@@ -134,10 +198,15 @@ func StopArgs(id string, timeoutSeconds uint) []string {
 	return []string{"stop", "--time", fmt.Sprintf("%d", timeoutSeconds), id}
 }
 
-// ExecArgs builds `podman exec -i <id> <cmd...>`; -i keeps the container
-// stdin attached to the CLI so interactive commands work (design §18.1).
-func ExecArgs(id string, cmd []string) []string {
-	return append([]string{"exec", "-i", id}, cmd...)
+// ExecArgs builds `podman exec <flags> <id> <cmd...>`. -i keeps the container
+// stdin attached to the CLI; -t additionally allocates a pseudo-TTY so
+// interactive shells behave like a real terminal (design §18.1).
+func ExecArgs(id string, cmd []string, tty bool) []string {
+	flags := "-i"
+	if tty {
+		flags = "-it"
+	}
+	return append([]string{"exec", flags, id}, cmd...)
 }
 
 // CommitArgs builds `podman commit <id>`; the output is the new image ref.
